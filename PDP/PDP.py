@@ -218,6 +218,107 @@ class OCSys:
                    "cost": sol['f'].full()}
 
         return opt_sol
+    
+    def ocSolverWithRef(self, ini_state, horizon, auxvar_value, ref, print_level=0, costate_option=0):
+        assert hasattr(self, 'state'), "Define the state variable first!"
+        assert hasattr(self, 'control'), "Define the control variable first!"
+        assert hasattr(self, 'dyn'), "Define the system dynamics first!"
+        assert hasattr(self, 'path_cost'), "Define the running cost function first!"
+        assert hasattr(self, 'final_cost'), "Define the final cost function first!"
+
+        if type(ini_state) == numpy.ndarray:
+            ini_state = ini_state.flatten().tolist()
+
+        # Start with an empty NLP
+        w = []
+        w0 = []
+        lbw = []
+        ubw = []
+        J = 0
+        g = []
+        lbg = []
+        ubg = []
+
+        # "Lift" initial conditions
+        Xk = MX.sym('X0', self.n_state)
+        w += [Xk]
+        lbw += ini_state
+        ubw += ini_state
+        w0 = ref['state_traj_opt'][0,:]
+
+        # Formulate the NLP
+        for k in range(horizon):
+            # New NLP variable for the control
+            Uk = MX.sym('U_' + str(k), self.n_control)
+            w += [Uk]
+            lbw += self.control_lb
+            ubw += self.control_ub
+            w0 = np.hstack((w0, ref['control_traj_opt'][k,:]))
+
+            # Integrate till the end of the interval
+            Xnext = self.dyn_fn(Xk, Uk, auxvar_value)
+            Ck = self.path_cost_fn(Xk, Uk, auxvar_value)
+            J = J + Ck
+
+            # New NLP variable for state at end of interval
+            Xk = MX.sym('X_' + str(k + 1), self.n_state)
+            w += [Xk]
+            lbw += self.state_lb
+            ubw += self.state_ub
+            w0 = np.hstack((w0, ref['state_traj_opt'][k,:]))
+
+            # Add equality constraint
+            g += [Xnext - Xk]
+            lbg += self.n_state * [0]
+            ubg += self.n_state * [0]
+
+        # Adding the final cost
+        J = J + self.final_cost_fn(Xk, auxvar_value)
+
+        # Create an NLP solver and solve it
+        opts = {'ipopt.print_level': print_level, 'ipopt.sb': 'yes', 'print_time': print_level}
+        prob = {'f': J, 'x': vertcat(*w), 'g': vertcat(*g)}
+        solver = nlpsol('solver', 'ipopt', prob, opts)
+        # Solve the NLP
+        sol = solver(x0=w0, lbx=lbw, ubx=ubw, lbg=lbg, ubg=ubg)
+        w_opt = sol['x'].full().flatten()
+
+        # take the optimal control and state
+        sol_traj = numpy.concatenate((w_opt, self.n_control * [0]))
+        sol_traj = numpy.reshape(sol_traj, (-1, self.n_state + self.n_control))
+        state_traj_opt = sol_traj[:, 0:self.n_state]
+        control_traj_opt = numpy.delete(sol_traj[:, self.n_state:], -1, 0)
+        time = numpy.array([k for k in range(horizon + 1)])
+
+        # Compute the costates using two options
+        if costate_option == 0:
+            # Default option, which directly obtains the costates from the NLP solver
+            costate_traj_opt = numpy.reshape(sol['lam_g'].full().flatten(), (-1, self.n_state))
+        else:
+            # Another option, which solve the costates by the Pontryagin's Maximum Principle
+            # The variable name is consistent with the notations used in the PDP paper
+            dfx_fun = casadi.Function('dfx', [self.state, self.control, self.auxvar], [jacobian(self.dyn, self.state)])
+            dhx_fun = casadi.Function('dhx', [self.state, self.auxvar], [jacobian(self.final_cost, self.state)])
+            dcx_fun = casadi.Function('dcx', [self.state, self.control, self.auxvar],
+                                      [jacobian(self.path_cost, self.state)])
+            costate_traj_opt = numpy.zeros((horizon, self.n_state))
+            costate_traj_opt[-1, :] = dhx_fun(state_traj_opt[-1, :], auxvar_value)
+            for k in range(horizon - 1, 0, -1):
+                costate_traj_opt[k - 1, :] = dcx_fun(state_traj_opt[k, :], control_traj_opt[k, :],
+                                                     auxvar_value).full() + numpy.dot(
+                    numpy.transpose(dfx_fun(state_traj_opt[k, :], control_traj_opt[k, :], auxvar_value).full()),
+                    costate_traj_opt[k, :])
+
+        # output
+        opt_sol = {"state_traj_opt": state_traj_opt,
+                   "control_traj_opt": control_traj_opt,
+                   "costate_traj_opt": costate_traj_opt,
+                   'auxvar_value': auxvar_value,
+                   "time": time,
+                   "horizon": horizon,
+                   "cost": sol['f'].full()}
+
+        return opt_sol
 
     def diffPMP(self):
         assert hasattr(self, 'state'), "Define the state variable first!"
